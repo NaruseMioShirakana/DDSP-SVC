@@ -767,20 +767,69 @@ def export_onnx(model_path, output_path):
             },
             opset_version=18
         )
-    x = model.reflow_model.velocity_fn(outtest[0].cpu(), t.cpu(), outtest[1].cpu())
-    torch.onnx.export(
-            After(args.vocoder.type == "nsf-hifigan-log10"),
-            (x.cpu()),
-            f"{output_path}/after.onnx",
-            input_names=["x"],
-            output_names=["mel_out"],
-            dynamic_axes={
-                "x": [3],
-            },
-            opset_version=18
-        )
+    
+    return args.data.encoder_out_channels, model.block_size, n_spk
 
 
 if __name__ == "__main__":
-    export_onnx("model/model_170000.pt", "model")
+    oc, bs, ns = export_onnx("model/model_170000.pt", "model")
+    
+    ortmodel = InferenceSession("model/encoder.onnx")
+    velocity = InferenceSession("model/velocity.onnx")
+
+    frame_c = 25
+    hu = torch.randn((1, frame_c, oc))                      # units feature, 1 x frame x units
+    mel2ph = torch.arange(0, frame_c).long().unsqueeze(0)   # alignment idx, units -> f0, eg. units(1, 5, ...) -> f0(1, 10) [0, 0, 1, 1, 2, 2, 3, 3, 4, 4]
+    f0 = torch.randn(1, frame_c)                            # f0, 1 x frame
+    vol = torch.randn(1, frame_c)                           # volume, 1 x frame
+    randn_input = torch.randn(1, frame_c * bs)              # noise input, 1 x frame x model.block_size512
+    
+    if ns is not None and ns > 1:
+        spk_mix = []
+        for _ in range(ns):
+            spk_mix.append(1.0/float(ns))
+        test_sid = torch.tensor(spk_mix)
+        test_sid = test_sid.unsqueeze(0)
+        test_sid = test_sid.repeat(frame_c, 1).unsqueeze(0) # 1 x frame x n_spk [[speaker1, speaker2, ...], [speaker1, speaker2, ...], ...]
+        ortinput = {
+            "hubert": hu.numpy(),
+            "mel2ph": mel2ph.numpy(),
+            "f0": f0.numpy(),
+            "volume": vol.numpy(),
+            "spk_mix": test_sid.numpy(),
+            "randn": randn_input.numpy()
+        }
+    else:
+        ortinput = {
+            "hubert": hu.numpy(),
+            "mel2ph": mel2ph.numpy(),
+            "f0": f0.numpy(),
+            "volume": vol.numpy(),
+            "randn": randn_input.numpy()
+        }
+    ortout = ortmodel.run(None, ortinput)
+    x = ortout[0]
+    cond = ortout[1]
+    dt = 0.05
+    t = np.array([0.0], dtype=np.float32)
+
+    '''
+    def sample_euler(self, x, t, dt, cond):
+        x += self.velocity_fn(x, 1000 * t, cond) * dt
+        t += dt
+        return x, t
+    '''
+    while t[0] <= 1.0:
+        ortout = velocity.run(None, {
+            "x": x,
+            "t": (t * 1000).astype(np.int64),
+            "cond": cond
+        })
+        x += ortout[0] * dt
+        t += dt
+
+    pass
+    # audio = vocoder(x, f0)
+    
+
     
